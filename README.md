@@ -105,6 +105,18 @@ Explicit tool input options take precedence.
 - The Node worker is trusted plugin code running as your user; the **generated script** is isolated. Installing this plugin still means trusting its code and QuickJS dependency. Native `Bash` is as powerful as it normally is, subject to your permissions.
 - Interruptions stop the worker and propagate through Claude's tool-call lifecycle. Calls already started can have irreversible side effects. **Neither failure nor cancellation rolls back tool side effects.** Always await calls; unawaited work is cancelled when the script ends.
 
+### Auto mode limitation
+
+In auto mode, a script's tool calls that would need approval are **denied**. Auto mode's classifier judges the model's own tool calls against your request; a call issued from a script is not one, so the classifier gives no verdict and the call fails closed with `auto mode classifier gave no verdict`. Calls that need no approval still work: read-only tools such as `Read`, `Grep`, and `Glob`, and anything matching your allow rules.
+
+To let scripts run specific commands in auto mode, allow them in your settings:
+
+```json
+{ "permissions": { "allow": ["Bash(git log:*)", "Bash(git status:*)", "Bash(npm test:*)"] } }
+```
+
+Codemode does not work around this, and scripts cannot supply approval themselves (see `consent` above). Other permission modes have not been tested with codemode yet.
+
 ## Limits and state
 
 | Limit | Value |
