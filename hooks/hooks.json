@@ -1,0 +1,4 @@
+{
+  "description": "Codemode tool bridge",
+  "modules": ["./register.js"]
+}

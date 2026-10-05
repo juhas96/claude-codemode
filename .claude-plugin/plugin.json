@@ -1,0 +1,13 @@
+{
+  "name": "codemode",
+  "version": "0.1.0",
+  "description": "Sandboxed JavaScript orchestration of Claude Code's native and connected MCP tools.",
+  "author": {
+    "name": "juhas96",
+    "url": "https://github.com/juhas96"
+  },
+  "homepage": "https://github.com/juhas96/claude-codemode",
+  "repository": "https://github.com/juhas96/claude-codemode",
+  "license": "MIT",
+  "keywords": ["codemode", "mcp", "quickjs", "sandbox", "orchestration"]
+}

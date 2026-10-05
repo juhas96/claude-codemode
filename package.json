@@ -1,0 +1,23 @@
+{
+  "name": "codemode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi-style codemode for Claude Code",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:plugin": "claude plugin test .",
+    "validate": "claude plugin validate --strict .",
+    "test:integration": "node --test tests/integration.mjs",
+    "test:all": "npm run build && npm test && npm run test:plugin && npm run test:integration && npm run validate"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "quickjs-emscripten": "0.32.0",
+    "esbuild": "0.28.2"
+  }
+}

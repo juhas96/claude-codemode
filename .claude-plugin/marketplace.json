@@ -1,0 +1,12 @@
+{
+  "name": "codemode",
+  "description": "Pi-style codemode for Claude Code's native and MCP tools",
+  "owner": { "name": "juhas96", "url": "https://github.com/juhas96" },
+  "plugins": [
+    {
+      "name": "codemode",
+      "source": "./",
+      "description": "Sandboxed JavaScript orchestration of native and connected MCP tools"
+    }
+  ]
+}
