@@ -1,10 +1,10 @@
 import { extractDeclaration } from './declarations.js';
 
 const NAME = 'mcp__codemode__execute';
-const active = new Set();
+const active = new Map();
 const description = `Run JavaScript in an isolated QuickJS sandbox to orchestrate native and connected MCP tools. Prefer this for parallel calls, chained calls, and filtering large results before they reach your context.
 Input: {code: "JavaScript", timeout_ms?: 60000, max_output_tokens?: 10000}. Top-level await and return are supported. No Node, filesystem, network, imports, or timers in scripts; use tools instead.
-Globals: tools.<name>(args), tools[exactName](args), callTool(name,args), ALL_TOOLS, searchTools(query,{limit?,namespace?}), describeTool(name), describeNamespace(namespace), text(value), console.log(...values), image(base64DataUrlOrImageBlock), store(key,value), load(key), exit(). tools return Claude Code's structured tool result; MCP object/array JSON text is decoded consistently (other text stays text). Denied/errored calls reject. Use Promise.allSettled for independent calls. Maximum 16 simultaneous calls. Await every call: outstanding calls are cancelled when the script ends.
+Globals: tools.<name>(args), tools[exactName](args), callTool(name,args), ALL_TOOLS, searchTools(query,{limit?,namespace?}), describeTool(name), describeNamespace(namespace), text(value), console.log(...values), image(base64DataUrlOrImageBlock) (no await needed), store(key,value), load(key), exit(). tools return Claude Code's structured tool result; MCP object/array JSON text is decoded consistently (other text stays text). Denied/errored calls reject. Use Promise.allSettled for independent calls. Maximum 16 simultaneous calls. Await every call: outstanding calls are cancelled when the script ends.
 Only text(), console, image(), and the top-level return are included in the result. Store writes commit only on success and persist per Claude session (not inherited by a new branch). Use describeTool before unfamiliar tools. If MCP input declarations are unavailable, describeTool loads its schema through native ToolSearch for your next turn; do not guess arguments. Native and MCP calls keep Claude Code's permissions and hooks. Side effects before an error are NOT rolled back.
 Example: const r = await tools.Read({file_path:'/absolute/path/package.json'}); text(r.file.content);
 Optional first line: // @options: {"timeout_ms":60000,"max_output_tokens":2000}`;
@@ -64,7 +64,8 @@ async function handleRequest($, request, catalog, loaded) {
   if (request.kind === 'describe') return describe($, request.name, catalog);
   if (request.kind === 'namespace') {
     if (typeof request.name !== 'string') throw new Error('Namespace must be a string');
-    return { name: request.name, tools: catalog.filter(t => t.name.startsWith(`mcp__${request.name}__`)) };
+    const tools = catalog.filter(t => t.name.startsWith(`mcp__${request.name}__`));
+    return tools.length ? { name: request.name, tools } : undefined;
   }
   if (request.kind !== 'call') throw new Error('Unknown bridge operation');
   if (request.name === NAME) throw new Error('Nested codemode execution is not allowed');
@@ -94,7 +95,8 @@ async function runScript($, input, signal) {
   validateInput(input);
   const session = await $.session.id();
   if (active.has(session)) throw new Error('Only one codemode script may run per session at a time');
-  active.add(session);
+  const lifecycle = new AbortController();
+  active.set(session, lifecycle);
   const token = crypto.randomUUID();
   const socketPath = `/tmp/cc-codemode-${crypto.randomUUID()}/bridge.sock`;
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
@@ -151,7 +153,10 @@ async function runScript($, input, signal) {
   } finally {
     if (!finished) cancel();
     signal.removeEventListener('abort', cancel);
-    active.delete(session);
+    lifecycle.abort();
+    // Keep the stopped scope until queued calls see it, including delayed host hooks.
+    if (pending.size) void Promise.allSettled(pending).then(() => active.delete(session));
+    else active.delete(session);
   }
 }
 
@@ -167,6 +172,12 @@ function render(result) {
 }
 
 export function register(on) {
+  on('tool.describe', async (_, e, next) => {
+    const result = await next(e);
+    if ([NAME, 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'].includes(e.tool)) return result;
+    const note = `Codemode batching/filtering: await callTool(${JSON.stringify(e.tool)}, args); emit only needed fields. Single calls can stay direct.`;
+    return { ...result, description: result.description + '\n' + note };
+  });
   on('session.start', async ($, e, next) => {
     await $.tool.register({ name: 'execute', description, inputSchema: {
       type: 'object', properties: {
@@ -185,6 +196,18 @@ export function register(on) {
       return result.ok ? { result: content } : { deny: content[0].text };
     }
     catch (error) { return { deny: `Codemode: ${error.message ?? error}. Earlier tool side effects are not rolled back.` }; }
+  });
+  // Returning while next(e) is pending aborts that child dispatch in Claude.
+  on('tool.call', async ($, e, next) => {
+    if (next.origin.plugin !== $.plugin.name) return next(e);
+    const lifecycle = active.get(await $.session.id());
+    if (!lifecycle) return next(e);
+    if (lifecycle.signal.aborted) return { deny: 'Codemode script ended; tool call cancelled' };
+    let stop;
+    const cancelled = new Promise(resolve => { stop = () => resolve({ deny: 'Codemode script ended; tool call cancelled' }); });
+    lifecycle.signal.addEventListener('abort', stop, { once: true });
+    try { return await Promise.race([next(e), cancelled]); }
+    finally { lifecycle.signal.removeEventListener('abort', stop); }
   });
   on('command.run', { command: 'codemode-status' }, async ($) => {
     const tools = catalogOf(await $.tool.list());

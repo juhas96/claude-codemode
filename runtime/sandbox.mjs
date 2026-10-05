@@ -7,6 +7,7 @@ export const LIMITS = Object.freeze({
   code: 262144, memory: 256 * 1024 * 1024, calls: 1024,
   concurrency: 16, output: 4 * 1024 * 1024, items: 10000,
   value: 262144, store: 1048576, rpc: 4 * 1024 * 1024,
+  images: 16, imageBytes: 2 * 1024 * 1024,
 });
 
 function parseJson(text) {
@@ -35,7 +36,7 @@ const bootstrap = `
 (() => {
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   const rpc = globalThis.__rpc, emit = globalThis.__emit;
-  const save = globalThis.__save, read = globalThis.__load;
+  const save = globalThis.__save, read = globalThis.__load, picture = globalThis.__image;
   const initial = parse(globalThis.__catalog);
   const encode = value => {
     const json = stringify(value);
@@ -67,20 +68,37 @@ const bootstrap = `
   const EXIT = Object.freeze({});
   globalThis.exit = () => { throw EXIT; };
   globalThis.__isExit = error => error === EXIT;
-  globalThis.image = value => call('image', '', value);
+  globalThis.image = value => picture(encode(value));
   globalThis.describeTool = name => call('describe', name);
   globalThis.describeNamespace = namespace => call('namespace', namespace);
   globalThis.searchTools = async (query, { limit = 8, namespace } = {}) => {
-    if (typeof query !== 'string' || !Number.isInteger(limit) || limit < 1 || limit > 100)
-      throw new Error('searchTools expects a string and limit between 1 and 100');
-    const terms = query.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
-    const catalog = await call('list');
-    return catalog.filter(t => !namespace || t.name.startsWith('mcp__' + namespace + '__'))
-      .map(t => ({ t, score: terms.reduce((n, term) => n +
-        (t.name.toLowerCase().includes(term) ? 4 : 0) +
-        (t.description.toLowerCase().includes(term) ? 1 : 0), 0) }))
-      .filter(r => !terms.length || r.score > 0).sort((a, b) => b.score - a.score)
-      .slice(0, limit).map(r => r.t);
+    if (typeof query !== 'string' || !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+        (namespace !== undefined && typeof namespace !== 'string'))
+      throw new Error('searchTools expects a string, limit between 1 and 100, and optional string namespace');
+    const words = value => value.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().match(/[\\p{L}\\p{N}]+/gu) || [];
+    const terms = [...new Set(words(query))];
+    const catalog = (await call('list')).filter(t => !namespace || t.name.startsWith('mcp__' + namespace + '__'));
+    if (!terms.length) return catalog.slice(0, limit);
+    const docs = catalog.map(t => {
+      const name = words(t.name);
+      const tokens = [...name, ...name, ...name, ...words(t.description)];
+      const counts = new Map();
+      for (const word of tokens) counts.set(word, (counts.get(word) || 0) + 1);
+      return { t, counts, length: tokens.length, score: 0 };
+    });
+    const average = docs.reduce((n, d) => n + d.length, 0) / Math.max(1, docs.length) || 1;
+    for (const term of terms) {
+      const frequencies = docs.map(d => [...d.counts].reduce((n, [word, count]) =>
+        n + (word === term || (term.length >= 3 && word.startsWith(term)) ? count : 0), 0));
+      const matches = frequencies.filter(n => n > 0).length;
+      const idf = Math.log(1 + (docs.length - matches + 0.5) / (matches + 0.5));
+      docs.forEach((d, i) => {
+        const tf = frequencies[i];
+        d.score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * d.length / average));
+      });
+    }
+    return docs.filter(d => d.score > 0).sort((a, b) => b.score - a.score)
+      .slice(0, limit).map(d => d.t);
   };
 })();
 `;
@@ -94,7 +112,8 @@ export async function runSandbox(input, dispatch, { signal, isCancelled = () => 
   const deadline = Date.now() + config.timeout_ms;
   runtime.setInterruptHandler(() => signal?.aborted || isCancelled() || Date.now() >= deadline);
   const vm = runtime.newContext();
-  const output = [];
+  const output = [], images = [];
+  let imageBytes = 0;
   const pending = new Set();
   const controller = new AbortController();
   const values = new Map(Object.entries(state).map(([k, v]) => [k, JSON.stringify(v)]));
@@ -160,6 +179,25 @@ export async function runSandbox(input, dispatch, { signal, isCancelled = () => 
 
   try {
     expose('__emit', handle => { emit(vm.getString(handle)); return vm.undefined; });
+    expose('__image', handle => {
+      const value = parseJson(vm.getString(handle));
+      let data = value?.data, mimeType = value?.mimeType ?? value?.media_type;
+      if (typeof value === 'string' || value?.image_url) {
+        const match = String(typeof value === 'string' ? value : value.image_url)
+          .match(/^data:(image\/(?:png|jpeg|gif|webp));base64,([a-zA-Z0-9+/]*={0,2})$/);
+        if (!match) throw new Error('image() accepts local base64 images, not remote URLs');
+        [, mimeType, data] = match;
+      }
+      if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(mimeType) ||
+          typeof data !== 'string' || !/^[a-zA-Z0-9+/]*={0,2}$/.test(data))
+        throw new Error('Invalid image block');
+      if (images.length >= LIMITS.images || imageBytes + data.length > LIMITS.imageBytes)
+        throw new Error('Image limit: 2 MiB of base64 in total, 16 images per script');
+      if (!Buffer.from(data, 'base64').length) throw new Error('Invalid empty image');
+      images.push({ type: 'image', data, mimeType });
+      imageBytes += data.length;
+      return vm.undefined;
+    });
     expose('__rpc', handle => {
       const json = vm.getString(handle);
       if (Buffer.byteLength(json, 'utf8') > LIMITS.rpc) throw new Error('Bridge request exceeds 4 MiB');
@@ -227,6 +265,16 @@ export async function runSandbox(input, dispatch, { signal, isCancelled = () => 
     vm.dispose();
     runtime.dispose();
   }
+  if (images.length) {
+    try {
+      const dir = await mkdtemp(join(tmpdir(), 'cc-codemode-images-'));
+      for (const [index, picture] of images.entries()) {
+        const path = join(dir, `${index}.${picture.mimeType.split('/')[1]}`);
+        await writeFile(path, Buffer.from(picture.data, 'base64'), { mode: 0o600 });
+        picture.path = path;
+      }
+    } catch (failure) { error ??= String(failure?.message ?? failure) || 'Saving images failed'; }
+  }
   const full = output.join('\n');
   const maxChars = config.max_output_tokens * 4;
   let text = full, full_output_path;
@@ -238,7 +286,8 @@ export async function runSandbox(input, dispatch, { signal, isCancelled = () => 
     text = full.slice(0, half) + '\n… output truncated …\n' + full.slice(-half);
   }
   return {
-    ok: error === undefined, text, error, truncated: !!full_output_path, full_output_path,
+    ok: error === undefined, text, error, images: images.filter(picture => picture.path),
+    truncated: !!full_output_path, full_output_path,
     state: error !== undefined ? state : Object.fromEntries([...values].map(([k, v]) => [k, parseJson(v)])),
     wall_time_ms: config.timeout_ms - Math.max(0, deadline - Date.now()),
   };

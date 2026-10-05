@@ -94,9 +94,9 @@ test('parallel images use distinct files in a single private directory', async (
   await rm(dirname(output.images[0].path), { recursive: true });
 });
 
-test('parallel image reservations cannot exceed the total image limit', async () => {
+test('image count limits hold even when individual errors are caught', async () => {
   const worker = await start(`const png='data:image/png;base64,${png}'; await image(png);
-    const r=await Promise.allSettled(Array.from({length:16},()=>image(png)));
+    const r=await Promise.allSettled(Array.from({length:16},()=>Promise.resolve().then(()=>image(png))));
     text(r.filter(x=>x.status==='rejected').length);`);
   await request(worker.socketPath, worker.token, '/poll').catch(() => {});
   const output = await worker.result;
@@ -104,6 +104,29 @@ test('parallel image reservations cannot exceed the total image limit', async ()
   assert.equal(output.images.length, 16);
   assert.equal(output.text, '1');
   await rm(dirname(output.images[0].path), { recursive: true });
+});
+
+test('image() is synchronous and saves partial images on failure and exit()', async () => {
+  for (const tail of ['return "done";', 'exit();', 'throw Error("after image");']) {
+    const worker = await start(`text(typeof image({image_url:'data:image/png;base64,${png}'})); ${tail}`);
+    await request(worker.socketPath, worker.token, '/poll').catch(() => {});
+    const output = await worker.result;
+    assert.equal(output.images.length, 1);
+    assert.ok(output.text.startsWith('undefined'));
+    assert.equal(output.ok, !tail.startsWith('throw'));
+    assert.deepEqual(await readFile(output.images[0].path), Buffer.from(png, 'base64'));
+    await rm(dirname(output.images[0].path), { recursive: true });
+  }
+});
+
+test('invalid synchronous images can be caught without failing the script', async () => {
+  const worker = await start('try { image("https://example.com/a.png") } catch(e) { text(e.message) } return "done";');
+  await request(worker.socketPath, worker.token, '/poll').catch(() => {});
+  const output = await worker.result;
+  assert.equal(output.ok, true);
+  assert.equal(output.images.length, 0);
+  assert.match(output.text, /not remote URLs/);
+  assert.ok(output.text.endsWith('done'));
 });
 
 test('worker refuses paths outside its fresh private run directory', async () => {

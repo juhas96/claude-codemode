@@ -4,22 +4,25 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { access } from 'node:fs/promises';
+import { access, mkdir, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL('..', import.meta.url));
 const fixture = JSON.stringify({ mcpServers: { fixture: { command: process.execPath, args: [root + 'tests/fixture-mcp.mjs'] } } });
+// Fail before launching -p if a hook cannot load; unknown commands can fall through to the model.
+await exec('claude', ['plugin', 'validate', '--strict', root]);
+await exec('claude', ['plugin', 'validate', '--strict', root + 'tests/probe']);
 const common = ['--plugin-dir', root, '--plugin-dir', root + 'tests/probe', '--permission-mode', 'dontAsk', '--strict-mcp-config'];
-async function command(code, flags = []) {
-  const child = exec('claude', ['-p', '/codemode-test-probe ' + code, ...common, ...flags], { cwd: root, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
+async function command(code, flags = [], name = 'codemode-test-probe') {
+  const child = exec('claude', ['-p', '/' + name + ' ' + code, ...common, ...flags], { cwd: root, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
   child.child.stdin.end();
   const { stdout, stderr } = await child;
   assert.equal(stderr, '');
   let result;
   try { result = JSON.parse(stdout.slice(stdout.indexOf(': ') + 2)); }
   catch { throw new Error(`Invalid probe response: ${stdout}`); }
-  return (result.text ?? result.deny ?? '') + '\n' + JSON.stringify(result.result);
+  return (result.text ?? result.deny ?? '') + '\n' + JSON.stringify(result);
 }
 
 test('registered tool passes the real engine output mapper, including images and errors', async () => {
@@ -29,10 +32,15 @@ test('registered tool passes the real engine output mapper, including images and
   const failed = await command('text("before"); throw Error("EXPECTED_ERROR")');
   assert.match(failed, /EXPECTED_ERROR/);
   assert.match(failed, /before/);
+  assert.match(failed, /"deny":|"isError":true/);
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6PAAAAABJRU5ErkJggg==';
-  const image = await command(`await image('data:image/png;base64,${png}');`);
+  const image = await command(`image('data:image/png;base64,${png}');`);
   assert.match(image, /"type":"image"/);
   assert.ok(!image.includes('does not match its output shape'));
+  const partial = await command(`image('data:image/png;base64,${png}'); throw Error('AFTER_IMAGE');`);
+  assert.match(partial, /AFTER_IMAGE/);
+  assert.match(partial, /Image saved:/);
+  assert.match(partial, /"deny":|"isError":true/);
 });
 
 test('installed runtime and native tool calls return only selected output', async () => {
@@ -70,6 +78,51 @@ test('persistent per-session state resumes, and failed scripts do not commit wri
   assert.match(await command('store("count",7); return load("count");', ['--session-id', session]), /\n7/);
   assert.match(await command('store("count",99); throw Error("expected");', ['--resume', session]), /Script failed/);
   assert.match(await command('return load("count");', ['--resume', session]), /\n7/);
+});
+
+test('script timeout cancels an in-flight Bash call while the Claude session stays alive', async () => {
+  const dir = '/tmp/codemode-cancel-' + randomUUID();
+  await mkdir(dir, { mode: 0o700 });
+  try {
+    const shell = `printf started > '${dir}/started'; sleep 5; printf done > '${dir}/done'`;
+    const result = await command(`// @options: {"timeout_ms":3000}\nawait tools.Bash({command:${JSON.stringify(shell)}});`,
+      ['--allowedTools', 'Bash'], 'codemode-test-cancel-probe');
+    assert.match(result, /Script timed out/);
+    assert.equal(await readFile(dir + '/started', 'utf8'), 'started');
+    await assert.rejects(access(dir + '/done'), { code: 'ENOENT' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('normal completion cancels already-started unawaited tools', async () => {
+  const dir = '/tmp/codemode-cancel-' + randomUUID();
+  await mkdir(dir, { mode: 0o700 });
+  try {
+    const shell = `printf started > '${dir}/started'; sleep 5; printf done > '${dir}/done'`;
+    const wait = `while [ ! -f '${dir}/started' ]; do sleep 0.01; done`;
+    const result = await command(`
+      tools.Bash({command:${JSON.stringify(shell)}});
+      await tools.Bash({command:${JSON.stringify(wait)},timeout:3000});
+      return "finished without awaiting the first tool";
+    `, ['--allowedTools', 'Bash'], 'codemode-test-cancel-probe');
+    assert.match(result, /Script completed/);
+    assert.equal(await readFile(dir + '/started', 'utf8'), 'started');
+    await assert.rejects(access(dir + '/done'), { code: 'ENOENT' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('script timeout cancels an in-flight MCP call while its server stays connected', async () => {
+  const dir = '/tmp/codemode-cancel-' + randomUUID();
+  await mkdir(dir, { mode: 0o700 });
+  const config = JSON.parse(fixture);
+  config.mcpServers.fixture.env = { CODEMODE_TEST_CANCEL_DIR: dir };
+  try {
+    const result = await command('// @options: {"timeout_ms":3000}\nawait tools.mcp__fixture__slow({});',
+      ['--mcp-config', JSON.stringify(config), '--allowedTools', 'ToolSearch', 'mcp__fixture__slow'], 'codemode-test-cancel-probe');
+    assert.match(result, /Script timed out/);
+    assert.equal(await readFile(dir + '/started', 'utf8'), 'started');
+    assert.equal(await readFile(dir + '/cancelled', 'utf8'), 'cancelled');
+    await assert.rejects(access(dir + '/done'), { code: 'ENOENT' });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('a real worker terminates an infinite script with partial output intact', async () => {

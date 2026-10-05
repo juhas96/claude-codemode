@@ -33,6 +33,19 @@ test('registers agent execution and only the user-facing status command', async 
   expect(commands).toEqual(['codemode-status']);
 });
 
+test('tool guidance preserves descriptions and deferral without steering control tools', async ($, on) => {
+  on('tool.describe', (_, e) => ({ description: e.description, isDeferred: e.isDeferred }));
+  const provider = { plugin: 'engine', tier: 'core' } as const;
+  const guided = await $.tool.describe({ tool: 'Read', description: 'Original instructions', provider, isDeferred: true });
+  expect(guided.description).toContain('Original instructions');
+  expect(guided.description).toContain('await callTool("Read", args)');
+  expect(guided.isDeferred).toBe(true);
+  for (const tool of ['mcp__codemode__execute', 'ToolSearch', 'AskUserQuestion']) {
+    const unchanged = await $.tool.describe({ tool, description: 'Control tool', provider });
+    expect(unchanged.description).toBe('Control tool');
+  }
+});
+
 test('custom tool returns Claude-compatible content blocks and commits state', async ($, on) => {
   const saved = setup(on);
   const answer = await $.tool.call({ tool: 'mcp__codemode__execute', code: 'return 1' });

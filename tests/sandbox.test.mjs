@@ -70,6 +70,40 @@ test('discovery and namespaces return bounded data', async () => {
   assert.equal(result.text, 'mcp__test-server__double\ntype Input = {}\ntest-server');
 });
 
+test('BM25 discovery splits identifiers, rewards rare terms, and filters namespaces', async () => {
+  const tools = [
+    { name: 'mcp__noise__search', description: 'Search '.repeat(40), mcp: true },
+    { name: 'mcp__github__searchIssues', description: 'Search issues and pull requests', mcp: true },
+    { name: 'mcp__github__openPullRequest', description: 'Open a pull request', mcp: true },
+    { name: 'mcp__media__generateImages', description: 'Generate pictures from a prompt', mcp: true },
+  ];
+  const result = await run(`
+    text((await searchTools('search issues'))[0].name);
+    text((await searchTools('pull request',{namespace:'github',limit:1}))[0].name);
+    text((await searchTools('image'))[0].name);
+    text((await searchTools('github_searchIssues'))[0].name);
+    text((await searchTools('nothing-matches')).length);
+    text((await searchTools('',{limit:2})).length);
+    try { await searchTools('x',{namespace:42}) } catch(e) { text(e.message) }
+  `, async () => tools);
+  assert.equal(result.ok, true);
+  const lines = result.text.split('\n');
+  assert.deepEqual(lines.slice(0, 6), [
+    'mcp__github__searchIssues', 'mcp__github__openPullRequest', 'mcp__media__generateImages',
+    'mcp__github__searchIssues', '0', '2',
+  ]);
+  assert.match(lines[6], /namespace/);
+});
+
+test('BM25 discovery handles Unicode and empty namespaces without invalid scores', async () => {
+  const result = await run(`
+    text((await searchTools('検索'))[0].name);
+    text(await searchTools('x',{namespace:'missing'}));
+  `, async () => [{ name: 'mcp__test__検索', description: '日本語の検索', mcp: true }]);
+  assert.equal(result.ok, true);
+  assert.equal(result.text, 'mcp__test__検索\n[]');
+});
+
 test('no Node APIs, networking, timers, imports, or host constructor escape', async () => {
   const result = await run(`return [typeof process,typeof require,typeof fetch,typeof setTimeout,
     tools.Read.constructor('return typeof process')(),typeof WebAssembly];`);

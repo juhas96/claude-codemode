@@ -1,7 +1,6 @@
 import http from 'node:http';
-import { mkdir, chmod, rm, mkdtemp, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { mkdir, chmod, rm } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -89,13 +88,11 @@ export async function serve(config) {
   await mkdir(directory, { mode: 0o700 }); // Fails if anything already occupies the path.
   const controller = new AbortController();
   const queue = new Map();
-  const images = [];
-  let id = 0, started = false, imageDirectory, imageCount = 0, imageBytes = 0;
+  let id = 0, started = false;
   let resolvePoll;
   const notify = () => { resolvePoll?.(); resolvePoll = undefined; };
   const dispatch = (request, signal) => {
     if (signal.aborted) return Promise.reject(new Error('Bridge call cancelled'));
-    if (request.kind === 'image') return saveImage(request.args);
     return new Promise((resolve, reject) => {
       const number = ++id;
       const abort = () => { queue.delete(number); reject(new Error('Bridge call cancelled')); };
@@ -107,26 +104,6 @@ export async function serve(config) {
       notify();
     });
   };
-  async function saveImage(value) {
-    let data, mimeType;
-    if (typeof value === 'string' || value?.image_url) {
-      const match = String(typeof value === 'string' ? value : value.image_url).match(/^data:(image\/(?:png|jpeg|gif|webp));base64,([a-zA-Z0-9+/]*={0,2})$/);
-      if (!match) throw new Error('image() accepts local base64 images, not remote URLs');
-      [, mimeType, data] = match;
-    } else { data = value?.data; mimeType = value?.mimeType ?? value?.media_type; }
-    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(mimeType) ||
-        typeof data !== 'string' || !/^[a-zA-Z0-9+/]*={0,2}$/.test(data)) throw new Error('Invalid image block');
-    const bytes = Buffer.from(data, 'base64');
-    if (!bytes.length || imageBytes + data.length > 2 * 1024 * 1024 || imageCount >= 16)
-      throw new Error('Image limit: 2 MiB of base64 in total, 16 images per script');
-    const index = imageCount++;
-    imageBytes += data.length;
-    imageDirectory ??= mkdtemp(join(tmpdir(), 'cc-codemode-images-'));
-    const path = join(await imageDirectory, `${index}.${mimeType.split('/')[1]}`);
-    await writeFile(path, bytes, { mode: 0o600 });
-    images.push({ type: 'image', data, mimeType, path, index });
-    return { path, mimeType };
-  }
   const token = Buffer.from(`Bearer ${config.token}`);
   const server = http.createServer(async (request, response) => {
     const credential = Buffer.from(request.headers.authorization ?? '');
@@ -180,7 +157,7 @@ export async function serve(config) {
     while (!started && !controller.signal.aborted) await new Promise(resolve => setTimeout(resolve, 10));
     // Keep socket handling responsive even while guest code is CPU-bound.
     const result = await runInThread(opts, config.state, config.catalog, dispatch, controller.signal);
-    return { ...result, images: images.sort((a, b) => a.index - b.index) };
+    return { ...result, images: result.images ?? [] };
   } finally {
     clearInterval(watchdog);
     process.removeListener('SIGTERM', terminate);

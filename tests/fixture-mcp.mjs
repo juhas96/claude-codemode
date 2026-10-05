@@ -1,10 +1,19 @@
 // Tiny stdio MCP server for integration tests; no external services or credentials.
 import readline from 'node:readline';
+import { writeFile } from 'node:fs/promises';
+
+const pending = new Map();
+const marker = name => writeFile(process.env.CODEMODE_TEST_CANCEL_DIR + '/' + name, name);
 
 const schema = { type: 'object', properties: { value: { type: 'integer' } }, required: ['value'], additionalProperties: false };
 for await (const line of readline.createInterface({ input: process.stdin })) {
   let request;
   try { request = JSON.parse(line); } catch { continue; }
+  if (request.method === 'notifications/cancelled' && pending.has(request.params?.requestId)) {
+    clearTimeout(pending.get(request.params.requestId));
+    pending.delete(request.params.requestId);
+    await marker('cancelled');
+  }
   if (!Object.hasOwn(request, 'id')) continue;
   let result;
   switch (request.method) {
@@ -16,9 +25,19 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       result = { tools: [
         { name: 'double', description: 'Double an integer. Input: {value: integer}.', inputSchema: schema },
         { name: 'fail', description: 'Always return an MCP error.', inputSchema: { type: 'object', properties: {} } },
+        { name: 'slow', description: 'Wait five seconds; used only for cancellation tests.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
       ] };
       break;
     case 'tools/call':
+      if (request.params.name === 'slow' && process.env.CODEMODE_TEST_CANCEL_DIR) {
+        await marker('started');
+        pending.set(request.id, setTimeout(async () => {
+          pending.delete(request.id);
+          await marker('done');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: 'done' }] } }) + '\n');
+        }, 5000));
+        continue;
+      }
       if (request.params.name === 'fail') result = { isError: true, content: [{ type: 'text', text: 'fixture failed' }] };
       else if (request.params.name === 'double' && Number.isInteger(request.params.arguments?.value))
         result = { content: [{ type: 'text', text: String(request.params.arguments.value * 2) }], structuredContent: { value: request.params.arguments.value * 2 } };
