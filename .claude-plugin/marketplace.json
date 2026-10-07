@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "codemode",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "source": "./",
       "description": "Sandboxed JavaScript orchestration of native and connected MCP tools"
     }

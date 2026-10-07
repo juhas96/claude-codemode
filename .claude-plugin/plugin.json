@@ -1,6 +1,6 @@
 {
   "name": "codemode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Sandboxed JavaScript orchestration of Claude Code's native and connected MCP tools.",
   "author": {
     "name": "juhas96",
@@ -9,5 +9,14 @@
   "homepage": "https://github.com/juhas96/claude-codemode",
   "repository": "https://github.com/juhas96/claude-codemode",
   "license": "MIT",
-  "keywords": ["codemode", "mcp", "quickjs", "sandbox", "orchestration"]
+  "keywords": ["codemode", "mcp", "quickjs", "sandbox", "orchestration"],
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Codemode mode",
+      "description": "on keeps native tools visible and steers Claude to batch them in codemode scripts; only also defers Read, Edit, Write, Bash and other core tools behind ToolSearch so scripts become the way to call them.",
+      "default": "on",
+      "options": ["on", "only"]
+    }
+  }
 }

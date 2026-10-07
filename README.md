@@ -13,9 +13,35 @@ claude plugin install codemode@codemode
 
 Or inside a session: `/plugin marketplace add juhas96/claude-codemode`, then `/plugin install codemode@codemode`. Start a new session or run `/reload-plugins`. No `npm install` is needed: the QuickJS runtime ships prebuilt in `dist/`.
 
-Claude gets the agent-only tool **`mcp__codemode__execute`** automatically and chooses when to use it. Native/MCP descriptions include short batching/filtering guidance; single calls can stay direct, and user-interaction/plan tools are left alone. You give normal requests; Claude writes and executes the scripts. No user-facing run command is needed.
+### Recommended setup
 
-For an optional installation check, run `/codemode-status`.
+1. **Start a new session** after installing or updating. The tool, its description and the system-prompt guidance are set when a session starts.
+2. **Using auto mode? Turn on the Bash sandbox.** Otherwise only reads and read-only commands work from scripts. Add this to `~/.claude/settings.json` (all projects) or `.claude/settings.json` (one project):
+
+   ```json
+   { "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true } }
+   ```
+
+   Edits made from scripts are still denied in auto mode, so Claude makes those directly. See [Auto mode](#auto-mode).
+3. **Optional: use `mode: only`** if Claude still prefers its native tools. See [Mode](#mode).
+4. **Check the setup with `/codemode-status`.** It reports the runtime, the mode, and an auto-mode note.
+
+Claude gets the agent-only tool **`mcp__codemode__execute`** automatically and chooses when to use it. You give normal requests; Claude writes and executes the scripts. No user-facing run command is needed.
+
+The plugin steers Claude toward scripts the way pi's built-in codemode does:
+
+- The execute tool is always loaded, never deferred behind ToolSearch.
+- A system-prompt section tells Claude to use a script for any step that needs more than one tool call.
+- The execute description declares the core native tools (`Read`, `Edit`, `Write`, `Bash`, plus `Grep`, `Glob` and `WebFetch` when the session has them) with their exact arguments and result shapes, so no `describeTool()` round trip is needed.
+- Every other tool's description ends with how to call it from a script and what it resolves to. User-interaction and plan tools are left alone.
+
+### Mode
+
+Set the plugin option `mode` in `/config` or in settings (`"pluginConfigs": {"codemode": {"options": {"mode": "only"}}}`):
+
+- `on` (default): native tools stay visible, and Claude is steered to batch them in scripts.
+- `only`: the core native tools are also deferred behind ToolSearch, so scripts become the normal way to call them. Claude can still load one with ToolSearch, for example after a script call of it was denied.
+
 
 Ask Claude to use codemode to batch or filter tool calls. Its input is `{ "code": "JavaScript source", "timeout_ms": 60000, "max_output_tokens": 10000 }`; the last two fields are optional.
 
@@ -114,17 +140,26 @@ Explicit tool input options take precedence.
 - The Node worker is trusted plugin code running as your user; the **generated script** is isolated. Installing this plugin still means trusting its code and QuickJS dependency. Native `Bash` is as powerful as it normally is, subject to your permissions.
 - Interruptions stop the worker and propagate through Claude's tool-call lifecycle. A scoped hook also cancels running native/MCP child dispatches on timeout, failure, or normal completion with outstanding calls. Real integration tests keep the session/server alive afterward to verify cancellation—not merely CLI shutdown. MCP servers must honor cancellation, and explicitly detached/background jobs may outlive their launching tool. Calls already started can have irreversible side effects. **Neither failure nor cancellation rolls back tool side effects.** Always await tool calls.
 
-### Auto mode limitation
+### Auto mode
 
-In auto mode, a script's tool calls that would need approval are **denied**. Auto mode's classifier judges the model's own tool calls against your request; a call issued from a script is not one, so the classifier gives no verdict and the call fails closed with `auto mode classifier gave no verdict`. Calls that need no approval still work: read-only tools such as `Read`, `Grep`, and `Glob`, and anything matching your allow rules.
+Auto mode's classifier reviews the model's own tool calls. A call issued from a script is not one, so when a call needs review, the classifier gives no verdict and the call fails closed (`auto mode classifier gave no verdict`). Codemode turns that error into a hint to make the call directly. Measured with Claude Code 2.1.292 in auto mode with server-side classifier review:
 
-To let scripts run specific commands in auto mode, allow them in your settings:
+| Script call | Result |
+| --- | --- |
+| `Read`, read-only Bash such as `ls` or `git status` | Runs |
+| `Edit` / `Write` in the working directory, even with an allow rule | Denied |
+| State-changing Bash with only an allow rule, such as `Bash(touch *)` | Denied |
+| State-changing Bash with the sandbox's auto-allow mode on | Runs |
+
+So in auto mode scripts are for reading, searching, filtering and checks, and Claude makes edits directly. To let scripts run state-changing shell commands, turn on [Claude Code's Bash sandbox](https://code.claude.com/docs/en/sandboxing) with auto-allow:
 
 ```json
-{ "permissions": { "allow": ["Bash(git log:*)", "Bash(git status:*)", "Bash(npm test:*)"] } }
+{ "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true } }
 ```
 
-Codemode does not work around this, and scripts cannot supply approval themselves (see `consent` above). Other permission modes have not been tested with codemode yet.
+Sandboxed commands can write only inside the sandbox's allowed directories and reach only allowed hosts. Commands in `excludedCommands`, commands that name extra network hosts, and unsandboxed retries still need review, so from scripts they are denied. `/codemode-status` prints this note when the default permission mode is auto.
+
+Codemode does not work around this, and scripts cannot supply approval themselves (see `consent` above).
 
 ## Limits and state
 
@@ -143,7 +178,7 @@ Codemode does not work around this, and scripts cannot supply approval themselve
 
 Store writes commit **only if the script succeeds**. State persists under the Claude session ID, survives resuming that session, and does not automatically copy to a newly forked session. Concurrent scripts in one session are rejected to avoid lost updates. Claude's own plugin store has a shared 4 MiB limit, so several large session stores can reach that host limit. Output/image files are retained under the OS temporary directory; remove them when no longer needed.
 
-This implements the useful codemode orchestration features, not full codemode parity: `models` helpers, branch-history state restoration, raw-JavaScript tool input, configurable inline declaration budgets, and strict `codemode-only` tool hiding are not implemented. Claude still offers its ordinary tools, and managed policies can disable mods/process/network APIs. Windows, cloud-only runtimes, and non-CLI surfaces are not supported by this implementation.
+This implements the useful codemode orchestration features, not full codemode parity: `models` helpers, branch-history state restoration, raw-JavaScript tool input, and configurable inline declaration budgets are not implemented. `mode: only` defers native tools behind ToolSearch rather than hiding them as pi does, and managed policies can disable mods/process/network APIs. Windows, cloud-only runtimes, and non-CLI surfaces are not supported by this implementation.
 
 ## Tests
 
@@ -158,7 +193,8 @@ The automated suite invokes the agent tool through a test-only probe plugin and 
 
 ## Implementation
 
-- `hooks/register.js`: registration, agent guidance, discovery, permission-aware/cancellable tool bridge, session state.
+- `hooks/register.js`: registration, system-prompt guidance, tool placement, discovery, permission-aware/cancellable tool bridge, session state.
+- `hooks/declarations.js`: inline core-tool signatures and result shapes; extraction of generated input declarations.
 - `runtime/worker.mjs`: private socket RPC, thread interruption and cleanup.
 - `dist/`: `npm run build` output (bundled worker + QuickJS WASM) that installed plugins run.
 - `runtime/sandbox.mjs`: QuickJS VM, BM25 discovery, synchronous image capture, limits and output artifacts.

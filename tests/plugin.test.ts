@@ -6,6 +6,7 @@ type Reply = { id: number; value?: unknown; error?: string };
 
 const catalog = [
   { name: 'Read', description: 'Read files', mcp: false },
+  { name: 'Bash', description: 'Run commands', mcp: false },
   { name: 'ToolSearch', description: 'Load deferred tools', mcp: false },
   { name: 'mcp__fixture__double', description: 'Double an integer', mcp: true },
 ];
@@ -33,17 +34,50 @@ test('registers agent execution and only the user-facing status command', async 
   expect(commands).toEqual(['codemode-status']);
 });
 
-test('tool guidance preserves descriptions and deferral without steering control tools', async ($, on) => {
+test('execute description inlines core tool declarations within budget', async ($, on) => {
+  const tools: ToolSpec[] = [];
+  on('tool.list', () => ({ value: [...catalog, { name: 'Edit', description: 'Edit files', mcp: false }] }));
+  on('tool.register', (_, e) => { tools.push(e); return { value: { tool: 'mcp__codemode__execute' } }; });
+  on('command.register', (_, e) => ({ value: { command: e.name } }));
+  on('session.start', () => ({ cwd: '/work' }));
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' });
+  const description = tools[0]?.description ?? '';
+  expect(description).toContain('Read(args: { file_path: string');
+  expect(description).toContain('Edit(args:');
+  expect(description).toContain('Promise<{ stdout: string');
+  // Tools the session lacks are not declared.
+  expect(description).not.toContain('Glob(args:');
+  expect(description.length / 4).toBeLessThan(3000);
+});
+
+test('tool guidance preserves descriptions and deferral, and keeps execute loaded', async ($, on) => {
   on('tool.describe', (_, e) => ({ description: e.description, isDeferred: e.isDeferred }));
   const provider = { plugin: 'engine', tier: 'core' } as const;
   const guided = await $.tool.describe({ tool: 'Read', description: 'Original instructions', provider, isDeferred: true });
   expect(guided.description).toContain('Original instructions');
-  expect(guided.description).toContain('await callTool("Read", args)');
+  expect(guided.description).toContain('`tools.Read(args)` resolves to');
+  expect(guided.description).not.toContain('Single calls can stay direct');
   expect(guided.isDeferred).toBe(true);
-  for (const tool of ['mcp__codemode__execute', 'ToolSearch', 'AskUserQuestion']) {
+  const mcp = await $.tool.describe({ tool: 'mcp__fixture__double', description: 'Double', provider });
+  expect(mcp.description).toContain('await callTool("mcp__fixture__double", args)');
+  const execute = await $.tool.describe({ tool: 'mcp__codemode__execute', description: 'Codemode', provider, isDeferred: true });
+  expect(execute.description).toBe('Codemode');
+  expect(execute.isDeferred).toBe(false);
+  for (const tool of ['ToolSearch', 'AskUserQuestion']) {
     const unchanged = await $.tool.describe({ tool, description: 'Control tool', provider });
     expect(unchanged.description).toBe('Control tool');
   }
+});
+
+test('system prompt gains codemode guidance only when the tool is offered', async ($, on) => {
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'Intro', scope: 'shared' }] }));
+  const base = { model: 'claude', promptModel: 'claude', surfaces: [], outputStyle: null, traits: [] };
+  const offered = await $.prompt.compose({ ...base, tools: ['Read', 'mcp__codemode__execute'] });
+  const guidance = offered.sections.find(s => s.id === 'codemode:guidance');
+  expect(guidance?.scope).toBe('session');
+  expect(guidance?.text).toContain('more than one tool call');
+  const absent = await $.prompt.compose({ ...base, tools: ['Read'] });
+  expect(absent.sections.map(s => s.id)).toEqual(['intro']);
 });
 
 test('custom tool returns Claude-compatible content blocks and commits state', async ($, on) => {
@@ -122,6 +156,13 @@ test('denials propagate as errors rather than becoming successful results', asyn
   const answer = await $.tool.call({ tool: 'mcp__codemode__execute', code: 'await tools.Read({file_path:"x"})' });
   expect(replies[0]?.error).toBe('policy denied');
   expect(answer.deny).toContain('policy denied');
+});
+
+test('auto-mode no-verdict denials explain how to recover', async ($, on) => {
+  const { replies } = bridge(on, { kind: 'call', name: 'Bash', args: { command: 'npm test' } }, { deny: 'auto mode classifier gave no verdict' });
+  await $.tool.call({ tool: 'mcp__codemode__execute', code: 'await tools.Bash({command:"npm test"})' });
+  expect(replies[0]?.error).toContain('make this call directly');
+  expect(replies[0]?.error).toContain('autoAllowBashIfSandboxed');
 });
 
 test('scripts cannot supply fake user consent or override the called tool', async ($, on) => {

@@ -1,13 +1,45 @@
-import { extractDeclaration } from './declarations.js';
+import { CORE_TOOLS, extractDeclaration, renderCoreDeclarations } from './declarations.js';
 
 const NAME = 'mcp__codemode__execute';
+const CONTROL_TOOLS = [NAME, 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
+const SANDBOX_SETTINGS = '{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true}}';
 const active = new Map();
-const description = `Run JavaScript in an isolated QuickJS sandbox to orchestrate native and connected MCP tools. Prefer this for parallel calls, chained calls, and filtering large results before they reach your context.
+// `only` mode defers these native tools behind ToolSearch, so scripts become the way to call them.
+const deferred = new Set();
+
+function describeExecute(names) {
+  const declarations = renderCoreDeclarations(names);
+  return `Run JavaScript in an isolated QuickJS sandbox that calls Claude Code's native and connected MCP tools. Only what the script emits reaches your context, so use it for any step that needs more than one tool call: batch reads and searches, chain search → read → edit, apply several edits, and filter large output.
 Input: {code: "JavaScript", timeout_ms?: 60000, max_output_tokens?: 10000}. Top-level await and return are supported. No Node, filesystem, network, imports, or timers in scripts; use tools instead.
 Globals: tools.<name>(args), tools[exactName](args), callTool(name,args), ALL_TOOLS, searchTools(query,{limit?,namespace?}), describeTool(name), describeNamespace(namespace), text(value), console.log(...values), image(base64DataUrlOrImageBlock) (no await needed), store(key,value), load(key), exit(). tools return Claude Code's structured tool result; MCP object/array JSON text is decoded consistently (other text stays text). Denied/errored calls reject. Use Promise.allSettled for independent calls. Maximum 16 simultaneous calls. Await every call: outstanding calls are cancelled when the script ends.
 Only text(), console, image(), and the top-level return are included in the result. Store writes commit only on success and persist per Claude session (not inherited by a new branch). Use describeTool before unfamiliar tools. If MCP input declarations are unavailable, describeTool loads its schema through native ToolSearch for your next turn; do not guess arguments. Native and MCP calls keep Claude Code's permissions and hooks. Side effects before an error are NOT rolled back.
-Example: const r = await tools.Read({file_path:'/absolute/path/package.json'}); text(r.file.content);
+${declarations ? `Core tools (exact arguments and results; find others with searchTools/describeTool):\n${declarations}\n` : ''}Example:
+const files = ['/abs/src/a.ts', '/abs/src/b.ts'];
+await Promise.all(files.map(file_path => tools.Read({ file_path })));
+const edits = await Promise.allSettled(files.map(file_path => tools.Edit({ file_path, old_string: 'oldName', new_string: 'newName', replace_all: true })));
+text(edits.map((r, i) => files[i] + ': ' + (r.status === 'fulfilled' ? 'edited' : r.reason.message)));
 Optional first line: // @options: {"timeout_ms":60000,"max_output_tokens":2000}`;
+}
+
+function guidance() {
+  const lines = [
+    '# Codemode',
+    `${NAME} runs a JavaScript script that calls your other tools (\`await tools.Read({ file_path })\`) and returns only what the script emits; intermediate tool results never enter your context.`,
+    '- Use it whenever a step needs more than one tool call: reading or searching several files, searching and then reading the matches, applying several edits, or editing and then running a check. One script replaces several parallel tool calls in one message, and chains of calls across turns.',
+    '- Emit only what you need (the lines, fields, counts or diffs), not whole files or full command output.',
+    '- A single call whose whole output you need anyway may stay direct.',
+    '- In auto mode the classifier cannot review calls made by scripts: Read and read-only commands work there, but Edit, Write and state-changing Bash are denied unless approval is not needed (for example, Bash runs in Claude Code\'s sandbox with auto-allow). Make those calls directly and keep using scripts for reading, searching and filtering.',
+  ];
+  if (deferred.size) lines.push(`- ${[...deferred].join(', ')} are deferred: call them from scripts (\`tools.Read(...)\`) instead of loading them with ToolSearch, unless a script call of theirs was denied.`);
+  return lines.join('\n');
+}
+
+function scriptHint(tool) {
+  const core = CORE_TOOLS[tool];
+  return core
+    ? `Codemode: \`tools.${tool}(args)\` resolves to ${core.brief}; batch, chain and filter several calls in one script.`
+    : `Codemode: \`await callTool(${JSON.stringify(tool)}, args)\` in a script batches, chains and filters calls; emit only needed fields.`;
+}
 
 function parseJson(text) {
   try { return JSON.parse(text); } catch { throw new Error('Invalid JSON from codemode worker'); }
@@ -75,14 +107,19 @@ async function handleRequest($, request, catalog, loaded) {
   for (const key of ['tool', 'tool_use_id', 'agentId', 'consent']) {
     if (Object.hasOwn(args, key)) throw new Error(`Reserved bridge argument: ${key}`);
   }
-  if (request.name.startsWith('mcp__') && !loaded.has(request.name)) {
+  if ((request.name.startsWith('mcp__') || deferred.has(request.name)) && !loaded.has(request.name)) {
     const found = await $.tool.call({ tool: 'ToolSearch', query: `select:${request.name}`, max_results: 1 });
     if (typeof found.deny === 'string' || found.isError) throw new Error(found.deny || found.text || 'ToolSearch failed');
     loaded.add(request.name);
   }
   // Do not use $.mcp.call: that API explicitly skips the permission dialog.
   const result = await $.tool.call({ ...args, tool: request.name });
-  if (typeof result.deny === 'string' || result.isError) throw new Error(result.deny || result.text || 'Tool failed');
+  if (typeof result.deny === 'string' || result.isError) {
+    const message = result.deny || result.text || 'Tool failed';
+    // Auto mode's classifier reviews the model's own calls only; a script's call fails closed.
+    if (/no verdict/i.test(message)) throw new Error(`${message}. ${request.name} needs auto-mode review, which script calls cannot get: make this call directly${request.name === 'Bash' ? `, or have the user enable the Bash sandbox (${SANDBOX_SETTINGS})` : ''}.`);
+    throw new Error(message);
+  }
   const value = result.result ?? result.text;
   // Claude can return a cached MCP tool's structured result as JSON text.
   if (request.name.startsWith('mcp__') && typeof value === 'string' && /^\s*[\[{]/.test(value)) {
@@ -171,15 +208,33 @@ function render(result) {
   return { content, isError: !result.ok };
 }
 
-export function register(on) {
+const AUTO_MODE_NOTE = `\nAuto mode: scripts can read and search (Read, read-only Bash), but Edit, Write and state-changing Bash calls from scripts are denied, because the classifier only reviews the model's own calls. Enable Claude Code's Bash sandbox so sandboxed commands from scripts run without review: ${SANDBOX_SETTINGS}`;
+
+async function autoModeNote($) {
+  try { return (await $.config.list()).some(row => row.key === 'permissionMode' && row.value === 'auto') ? AUTO_MODE_NOTE : ''; }
+  catch { return ''; }
+}
+
+export function register(on, options = {}) {
   on('tool.describe', async (_, e, next) => {
     const result = await next(e);
-    if ([NAME, 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'].includes(e.tool)) return result;
-    const note = `Codemode batching/filtering: await callTool(${JSON.stringify(e.tool)}, args); emit only needed fields. Single calls can stay direct.`;
-    return { ...result, description: result.description + '\n' + note };
+    if (e.tool === NAME) return { ...result, isDeferred: false };
+    if (CONTROL_TOOLS.includes(e.tool)) return result;
+    const description = result.description + '\n' + scriptHint(e.tool);
+    return deferred.has(e.tool) ? { description, isDeferred: true } : { ...result, description };
+  });
+  on('prompt.compose', async (_, e, next) => {
+    const result = await next(e);
+    if (!e.tools.includes(NAME)) return result;
+    return { sections: [...result.sections, { id: 'codemode:guidance', text: guidance(), scope: 'session' }] };
   });
   on('session.start', async ($, e, next) => {
-    await $.tool.register({ name: 'execute', description, inputSchema: {
+    let names;
+    try { names = new Set((await $.tool.list()).map(t => t.name)); }
+    catch { names = new Set(Object.keys(CORE_TOOLS)); }
+    deferred.clear();
+    if (options.mode === 'only') for (const name of Object.keys(CORE_TOOLS)) if (names.has(name)) deferred.add(name);
+    await $.tool.register({ name: 'execute', description: describeExecute(names), inputSchema: {
       type: 'object', properties: {
         code: { type: 'string', maxLength: 262144 },
         timeout_ms: { type: 'integer', minimum: 100, maximum: 300000 },
@@ -215,7 +270,8 @@ export function register(on) {
       const check = await $.process.run(['node', `${$.plugin.root}/dist/worker.mjs`, '--check']);
       if (check.exitCode) throw new Error(check.stderr || check.stdout);
       const info = parseJson(check.stdout);
-      return { text: `${info.runtime} ready (${info.node}). ${tools.filter(t => !t.mcp).length} native tools, ${tools.filter(t => t.mcp).length} MCP tools. The agent can use the execute tool automatically.` };
+      const mode = deferred.size ? ` Mode: only (${[...deferred].join(', ')} deferred to scripts).` : ' Mode: on.';
+      return { text: `${info.runtime} ready (${info.node}). ${tools.filter(t => !t.mcp).length} native tools, ${tools.filter(t => t.mcp).length} MCP tools. The agent can use the execute tool automatically.${mode}${await autoModeNote($)}` };
     } catch (error) { return { text: `Runtime unavailable: ${error.message ?? error}. Reinstall the plugin; Node.js 22+ and a Unix host are required.` }; }
   });
 }

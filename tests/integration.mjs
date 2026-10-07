@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 const exec = promisify(execFile);
@@ -64,6 +64,35 @@ test('real connected MCP discovery, parallel calls, chaining, and errors', async
   assert.match(result, /\[20,22\]/);
   assert.match(result, /\n84\n/);
   assert.match(result, /fixture failed/);
+});
+
+// Auto mode reviews only the model's own calls; with server-side review, script edits get no verdict.
+test('auto mode script edits either run or fail with a recovery hint', async () => {
+  const file = root + `tests/codemode-edit-${randomUUID()}.txt`;
+  await writeFile(file, 'alpha\n');
+  try {
+    const result = await command(`
+      await tools.Read({file_path:${JSON.stringify(file)}});
+      await tools.Edit({file_path:${JSON.stringify(file)}, old_string:'alpha', new_string:'gamma'});
+      text('EDITED');
+    `, ['--permission-mode', 'auto']);
+    if (/EDITED/.test(result)) assert.equal(await readFile(file, 'utf8'), 'gamma\n');
+    else {
+      assert.match(result, /make this call directly/);
+      assert.equal(await readFile(file, 'utf8'), 'alpha\n');
+    }
+  } finally { await rm(file, { force: true }); }
+});
+
+test('auto mode runs state-changing script Bash inside the auto-allowed sandbox', async () => {
+  const name = `tests/codemode-sandbox-${randomUUID()}`;
+  const sandbox = JSON.stringify({ sandbox: { enabled: true, autoAllowBashIfSandboxed: true } });
+  try {
+    const result = await command(`await tools.Bash({command:${JSON.stringify('touch ' + name)}}); text('TOUCHED');`,
+      ['--permission-mode', 'auto', '--settings', sandbox]);
+    assert.match(result, /TOUCHED/);
+    await access(root + name);
+  } finally { await rm(root + name, { force: true }); }
 });
 
 test('Claude permission deny rules still stop nested Bash calls', async () => {
