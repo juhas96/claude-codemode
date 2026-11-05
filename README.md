@@ -19,10 +19,10 @@ Or inside a session: `/plugin marketplace add juhas96/claude-codemode`, then `/p
 2. **Using auto mode? Turn on the Bash sandbox.** Otherwise only reads and read-only commands work from scripts. Add this to `~/.claude/settings.json` (all projects) or `.claude/settings.json` (one project):
 
    ```json
-   { "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true } }
+   { "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true, "network": { "allowLocalBinding": true } } }
    ```
 
-   Edits made from scripts are still denied in auto mode, so Claude makes those directly. See [Auto mode](#auto-mode).
+   Edits made from scripts are still denied in auto mode, so Claude makes those directly. See [Auto mode](#auto-mode). `allowLocalBinding` lets sandboxed commands reach databases and dev servers on localhost, which the sandbox otherwise blocks; see [Local services](#local-services).
 3. **Optional: use `mode: only`** if Claude still prefers its native tools. See [Mode](#mode).
 4. **Check the setup with `/codemode-status`.** It reports the runtime, the mode, and an auto-mode note.
 
@@ -160,6 +160,28 @@ So in auto mode scripts are for reading, searching, filtering and checks, and Cl
 Sandboxed commands can write only inside the sandbox's allowed directories and reach only allowed hosts. Commands in `excludedCommands`, commands that name extra network hosts, and unsandboxed retries still need review, so from scripts they are denied. `/codemode-status` prints this note when the default permission mode is auto.
 
 Codemode does not work around this, and scripts cannot supply approval themselves (see `consent` above).
+
+### Local services
+
+On macOS the sandbox also blocks connections to localhost, Unix sockets, and writes outside its allowed directories. Postgres, Redis, Docker or a dev server then fail with `Operation not permitted`, for example `connection to server at "localhost" … port 5432 failed: Operation not permitted`. A script cannot retry such a command unsandboxed, so codemode adds the settings below to the error. Allow what your projects need:
+
+```json
+{
+  "sandbox": {
+    "network": {
+      "allowLocalBinding": true,
+      "allowUnixSockets": ["~/.orbstack/run/docker.sock"]
+    },
+    "filesystem": { "allowWrite": ["~/.cache/uv"] }
+  }
+}
+```
+
+- `allowLocalBinding` covers connecting to any localhost port as well as listening on one. An entry for `localhost` in `allowedDomains` does not help, because database drivers ignore the sandbox proxy. Any unauthenticated localhost service can then act for a sandboxed command.
+- `allowUnixSockets` lists socket paths such as Docker's (`/var/run/docker.sock`, or OrbStack's above) or Postgres's (`/tmp/.s.PGSQL.5432`). Access to the Docker socket effectively grants access to the host.
+- `filesystem.allowWrite` adds directories, such as tool caches, that sandboxed commands may write.
+
+On Linux and WSL2, `allowLocalBinding` and `allowUnixSockets` have no effect. Use `excludedCommands` there; excluded commands go through normal permission review, so in auto mode Claude has to run them directly rather than from scripts.
 
 ## Limits and state
 

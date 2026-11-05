@@ -3,6 +3,9 @@ import { CORE_TOOLS, extractDeclaration, renderCoreDeclarations } from './declar
 const NAME = 'mcp__codemode__execute';
 const CONTROL_TOOLS = [NAME, 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
 const SANDBOX_SETTINGS = '{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true}}';
+// The sandbox blocks localhost TCP, Unix sockets and writes outside allowed directories (macOS).
+const LOCAL_SERVICES = 'sandbox.network.allowLocalBinding: true (localhost databases and dev servers), sandbox.network.allowUnixSockets: ["<socket path>"] (Docker or Postgres sockets), sandbox.filesystem.allowWrite: ["<dir>"] (tool caches such as ~/.cache/uv)';
+const SANDBOX_BLOCKED = /Operation not permitted|permission denied while trying to connect|connectx|port \d+ failed/i;
 const active = new Map();
 // `only` mode defers these native tools behind ToolSearch, so scripts become the way to call them.
 const deferred = new Set();
@@ -118,6 +121,8 @@ async function handleRequest($, request, catalog, loaded) {
     const message = result.deny || result.text || 'Tool failed';
     // Auto mode's classifier reviews the model's own calls only; a script's call fails closed.
     if (/no verdict/i.test(message)) throw new Error(`${message}. ${request.name} needs auto-mode review, which script calls cannot get: make this call directly${request.name === 'Bash' ? `, or have the user enable the Bash sandbox (${SANDBOX_SETTINGS})` : ''}.`);
+    // A script cannot retry a sandbox-blocked command unsandboxed; that needs a direct call or new settings.
+    if (request.name === 'Bash' && SANDBOX_BLOCKED.test(message)) throw new Error(`${message}\nThe Bash sandbox likely blocked a local connection or write, and scripts cannot retry it unsandboxed: make this call directly, or have the user add ${LOCAL_SERVICES}.`);
     throw new Error(message);
   }
   const value = result.result ?? result.text;
@@ -208,7 +213,7 @@ function render(result) {
   return { content, isError: !result.ok };
 }
 
-const AUTO_MODE_NOTE = `\nAuto mode: scripts can read and search (Read, read-only Bash), but Edit, Write and state-changing Bash calls from scripts are denied, because the classifier only reviews the model's own calls. Enable Claude Code's Bash sandbox so sandboxed commands from scripts run without review: ${SANDBOX_SETTINGS}`;
+const AUTO_MODE_NOTE = `\nAuto mode: scripts can read and search (Read, read-only Bash), but Edit, Write and state-changing Bash calls from scripts are denied, because the classifier only reviews the model's own calls. Enable Claude Code's Bash sandbox so sandboxed commands from scripts run without review: ${SANDBOX_SETTINGS}\nLocal services: the sandbox then blocks localhost databases, Docker and some caches; allow them with ${LOCAL_SERVICES}.`;
 
 async function autoModeNote($) {
   try { return (await $.config.list()).some(row => row.key === 'permissionMode' && row.value === 'auto') ? AUTO_MODE_NOTE : ''; }
