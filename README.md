@@ -15,23 +15,17 @@ Or inside a session: `/plugin marketplace add juhas96/claude-codemode`, then `/p
 
 ### Recommended setup
 
-1. **Start a new session** after installing or updating. The tool, its description and the system-prompt guidance are set when a session starts.
-2. **Using auto mode? Turn on the Bash sandbox.** Otherwise only reads and read-only commands work from scripts. Add this to `~/.claude/settings.json` (all projects) or `.claude/settings.json` (one project):
-
-   ```json
-   { "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true } }
-   ```
-
-   Edits made from scripts are still denied in auto mode, so Claude makes those directly. See [Auto mode](#auto-mode).
-3. **Optional: use `mode: only`** if Claude still prefers its native tools. See [Mode](#mode).
-4. **Check the setup with `/codemode-status`.** It reports the runtime, the mode, and an auto-mode note.
+1. **Start a new session** after installing or updating. The tool and its description are set when a session starts.
+2. **Optional: use `mode: only`** if Claude still prefers its native tools. See [Mode](#mode).
+3. **Check the setup with `/codemode-status`.** It reports the runtime, the mode, whether the system-prompt pointer was applied, and an auto-mode note. See [Auto mode](#auto-mode) if script calls are denied there.
 
 Claude gets the agent-only tool **`mcp__codemode__execute`** automatically and chooses when to use it. You give normal requests; Claude writes and executes the scripts. No user-facing run command is needed.
 
 The plugin steers Claude toward scripts the way pi's built-in codemode does:
 
 - The execute tool is always loaded, never deferred behind ToolSearch.
-- A system-prompt section tells Claude to use a script for any step that needs more than one tool call.
+- The execute description carries the guidance: use a script for any step that needs more than one tool call, emit only what is needed, and how failures behave. It stays under the 4,096 characters Claude sends of a tool description.
+- A one-line system-prompt section points at it. A plugin in a higher tier (an organization's managed plugin, for example) can bypass the `prompt.compose` hook, which is why the guidance lives in the description; `/codemode-status` says when the pointer was not applied, and `claude --debug` logs `prompt.compose bypassed by <plugin>`.
 - The execute description declares the core native tools (`Read`, `Edit`, `Write`, `Bash`, plus `Grep`, `Glob` and `WebFetch` when the session has them) with their exact arguments and result shapes, so no `describeTool()` round trip is needed.
 - Every other tool's description ends with how to call it from a script and what it resolves to. User-interaction and plan tools are left alone.
 
@@ -107,7 +101,7 @@ MCP tools return the structured value Claude Code exposes. When the engine retur
 
 | Global | Purpose |
 | --- | --- |
-| `tools.<name>(args)` | Call a native or MCP tool. Tool errors and denials reject. |
+| `tools.<name>(args)` | Call a native or MCP tool. Tool errors and denials reject, and so does Bash on a non-zero exit (append `\|\| true` to a grep that may find nothing). A name outside `ALL_TOOLS`, such as a subagent's own `WebFetch`, still goes to Claude Code, which checks the calling agent's tools. |
 | `tools[exactName](args)` / `callTool(name, args)` | Call a tool whose name is not a JavaScript identifier. |
 | `ALL_TOOLS` | Initial catalog: `{name, description, mcp, method}`. |
 | `searchTools(query, {limit?, namespace?})` | Refresh the catalog and rank with BM25, identifier boosts and prefix matching; default limit 8, maximum 100. |
@@ -116,7 +110,7 @@ MCP tools return the structured value Claude Code exposes. When the engine retur
 | `text(value)` / `console.log(...)` | Emit text or JSON. Other console levels work too. |
 | `return value` | Emit the final value, unless undefined. |
 | `image(data)` | Emit and save a base64 data URL, `{image_url}` object, or `{type:'image', data, mimeType}` block; **no await needed**. Returns undefined; validation errors throw synchronously. Remote URLs are rejected. |
-| `store(key, value)` / `load(key)` | Transactional JSON state; storing undefined deletes a key. |
+| `store(key, value)` / `load(key)` | Transactional JSON state per agent; storing undefined deletes a key. |
 | `exit()` | Finish successfully without running the rest of the script. |
 
 Names with punctuation get an underscore alias when unambiguous (`method` is null for a conflicting alias). Exact bracket names always work. `ALL_TOOLS` is a snapshot; use discovery plus `callTool()` for tools that appear after the script starts.
@@ -142,31 +136,22 @@ Explicit tool input options take precedence.
 
 ### Auto mode
 
-Auto mode's classifier reviews the model's own tool calls. A call issued from a script is not one, so when a call needs review, the classifier gives no verdict and the call fails closed (`auto mode classifier gave no verdict`). Codemode turns that error into a hint to make the call directly. Measured with Claude Code 2.1.292 in auto mode with server-side classifier review:
+Auto mode's classifier reviews the model's own tool calls. A call issued from a script is not one. Claude Code 2.1.292 with server-side classifier review denied script `Edit`, `Write` and state-changing Bash (`auto mode classifier gave no verdict`). Claude Code 2.1.325 runs them: a live check in auto mode edited a file and ran `rm` from a script, and 167 of 172 logged scripts with `Edit` or `Write` calls succeeded in auto-mode sessions.
 
-| Script call | Result |
-| --- | --- |
-| `Read`, read-only Bash such as `ls` or `git status` | Runs |
-| `Edit` / `Write` in the working directory, even with an allow rule | Denied |
-| State-changing Bash with only an allow rule, such as `Bash(touch *)` | Denied |
-| State-changing Bash with the sandbox's auto-allow mode on | Runs |
-
-So in auto mode scripts are for reading, searching, filtering and checks, and Claude makes edits directly. To let scripts run state-changing shell commands, turn on [Claude Code's Bash sandbox](https://code.claude.com/docs/en/sandboxing) with auto-allow:
+If your version or setup still denies a script call with no verdict, codemode turns the error into a hint to make that call directly. To let scripts run state-changing shell commands without review, turn on [Claude Code's Bash sandbox](https://code.claude.com/docs/en/sandboxing) with auto-allow:
 
 ```json
 { "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true } }
 ```
 
-Sandboxed commands can write only inside the sandbox's allowed directories and reach only allowed hosts. Commands in `excludedCommands`, commands that name extra network hosts, and unsandboxed retries still need review, so from scripts they are denied. `/codemode-status` prints this note when the default permission mode is auto.
-
-Codemode does not work around this, and scripts cannot supply approval themselves (see `consent` above).
+Sandboxed commands can write only inside the sandbox's allowed directories and reach only allowed hosts. `/codemode-status` prints this note when the default permission mode is auto. Codemode does not work around review, and scripts cannot supply approval themselves (see `consent` above).
 
 ## Limits and state
 
 | Limit | Value |
 | --- | --- |
 | Script source | 256 Ki characters |
-| Execution time | 60 seconds default; 100 ms–5 minutes |
+| Execution time | 60 seconds default; 100 ms–5 minutes. A timeout names the calls still running |
 | QuickJS heap / stack | 256 MiB / 1 MiB |
 | Node VM-thread old-generation heap | 128 MiB |
 | Concurrent bridge operations / total | 16 / 1024 per script |
@@ -174,9 +159,9 @@ Codemode does not work around this, and scripts cannot supply approval themselve
 | Captured text | 4 Mi characters / 10000 items |
 | Returned text | Approximate 10000 tokens by default; maximum 16000, estimated at four characters/token |
 | Images | 16; 2 MiB base64 in total |
-| One store value / total per session | 256 KiB / 1 MiB |
+| One store value / total per agent | 256 KiB / 1 MiB |
 
-Store writes commit **only if the script succeeds**. State persists under the Claude session ID, survives resuming that session, and does not automatically copy to a newly forked session. Concurrent scripts in one session are rejected to avoid lost updates. Claude's own plugin store has a shared 4 MiB limit, so several large session stores can reach that host limit. Output/image files are retained under the OS temporary directory; remove them when no longer needed.
+Store writes commit **only if the script succeeds**. State persists under the Claude session ID (plus the agent ID for a subagent), survives resuming that session, and does not automatically copy to a newly forked session. Scripts run one at a time per agent: a second script from the same agent waits for the first, while parallel subagents each run their own scripts and keep separate stores. Claude's own plugin store has a shared 4 MiB limit, so several large session stores can reach that host limit. Output/image files are retained under the OS temporary directory; remove them when no longer needed.
 
 This implements the useful codemode orchestration features, not full codemode parity: `models` helpers, branch-history state restoration, raw-JavaScript tool input, and configurable inline declaration budgets are not implemented. `mode: only` defers native tools behind ToolSearch rather than hiding them as pi does, and managed policies can disable mods/process/network APIs. Windows, cloud-only runtimes, and non-CLI surfaces are not supported by this implementation.
 
@@ -189,11 +174,13 @@ npm run test:integration # Real native/MCP calls, cancellation, deny rules, imag
 npm run test:all         # Build, everything above, and strict plugin validation
 ```
 
+CI (`.github/workflows/ci.yml`) runs the unit tests, checks that `dist/` matches a fresh build, and runs the plugin tests and strict validation on every push and pull request.
+
 The automated suite invokes the agent tool through a test-only probe plugin and a local fixture MCP server: **no model requests, external services, or API charges**. A separate live-model smoke check was also performed during development to verify that Claude can call the registered tool and receives only the selected output.
 
 ## Implementation
 
-- `hooks/register.js`: registration, system-prompt guidance, tool placement, discovery, permission-aware/cancellable tool bridge, session state.
+- `hooks/register.js`: registration, the execute description and its system-prompt pointer, tool placement, discovery, permission-aware/cancellable tool bridge, session state.
 - `hooks/declarations.js`: inline core-tool signatures and result shapes; extraction of generated input declarations.
 - `runtime/worker.mjs`: private socket RPC, thread interruption and cleanup.
 - `dist/`: `npm run build` output (bundled worker + QuickJS WASM) that installed plugins run.

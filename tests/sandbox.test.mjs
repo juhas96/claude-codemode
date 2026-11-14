@@ -27,8 +27,8 @@ test('alias collisions never silently dispatch to a different MCP server', async
   assert.equal(catalog[0].method, null);
   assert.equal(catalog[1].method, 'mcp__test_server__read');
   const called = [];
-  const result = await runSandbox({ code: `await tools['mcp__test-server__read']({}); await tools.mcp__test_server__read({}); return typeof tools.null;` }, async r => { called.push(r.name); }, { catalog });
-  assert.equal(result.text, 'undefined');
+  const result = await runSandbox({ code: `await tools['mcp__test-server__read']({}); await tools.mcp__test_server__read({}); return 'null' in tools;` }, async r => { called.push(r.name); }, { catalog });
+  assert.equal(result.text, 'false');
   assert.deepEqual(called, ['mcp__test-server__read', 'mcp__test_server__read']);
 });
 
@@ -41,6 +41,19 @@ test('MCP aliases, exact names, and callTool resolve to the actual tool name', a
   `, async r => { names.push(r.name); return r.args.value * 2; });
   assert.equal(result.text, '4\n6\n8');
   assert.deepEqual(names, Array(3).fill('mcp__test-server__double'));
+});
+
+test('tools outside the catalog dispatch by exact name, and the tools object stays read-only', async () => {
+  const names = [];
+  const result = await run(`
+    text(await tools.WebFetch({url: 'https://example.com'}));
+    text([typeof tools.then, 'WebFetch' in tools, Object.keys(tools).join()]);
+    tools.Read = 1; tools.Extra = 2;
+    text([typeof tools.Read, 'Extra' in tools]);
+  `, async r => { names.push(r.name); return r.name; });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.text, 'WebFetch\n["undefined",false,"Read,mcp__test-server__double,mcp__test_server__double"]\n["function",false]');
+  assert.deepEqual(names, ['WebFetch']);
 });
 
 test('independent calls execute concurrently, errors can be caught', async () => {
@@ -116,8 +129,10 @@ test('CPU loops, microtask loops, and stalled tools obey the deadline', async ()
   for (const code of ['while(true){}', 'while(true) await Promise.resolve()', 'await tools.Read({})']) {
     const result = await run(code, () => new Promise(() => {}), { input: { timeout_ms: 100 } });
     assert.equal(result.ok, false, code);
-    assert.equal(result.error, 'Script timed out', code);
+    assert.match(result.error, /^Script timed out after 100 ms/, code);
   }
+  const stalled = await run('await tools.Read({})', () => new Promise(() => {}), { input: { timeout_ms: 100 } });
+  assert.match(stalled.error, /waiting on Read; raise timeout_ms/);
 });
 
 test('an unresolved guest promise with no tools fails instead of hanging', async () => {
