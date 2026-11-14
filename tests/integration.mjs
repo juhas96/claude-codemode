@@ -18,7 +18,8 @@ async function command(code, flags = [], name = 'codemode-test-probe') {
   const child = exec('claude', ['-p', '/' + name + ' ' + code, ...common, ...flags], { cwd: root, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
   child.child.stdin.end();
   const { stdout, stderr } = await child;
-  assert.equal(stderr, '');
+  // A managed higher-tier plugin may bypass codemode's prompt.compose hook; Claude notes it on stderr.
+  assert.equal(stderr.replace(/^\S+: its [\w.]+ hook was skipped\..*\n?/gm, ''), '');
   let result;
   try { result = JSON.parse(stdout.slice(stdout.indexOf(': ') + 2)); }
   catch { throw new Error(`Invalid probe response: ${stdout}`); }
@@ -66,7 +67,7 @@ test('real connected MCP discovery, parallel calls, chaining, and errors', async
   assert.match(result, /fixture failed/);
 });
 
-// Auto mode reviews only the model's own calls; with server-side review, script edits get no verdict.
+// Auto mode reviews the model's own calls. 2.1.292 gave script edits no verdict; 2.1.325 runs them. Either outcome is valid.
 test('auto mode script edits either run or fail with a recovery hint', async () => {
   const file = root + `tests/codemode-edit-${randomUUID()}.txt`;
   await writeFile(file, 'alpha\n');

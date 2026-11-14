@@ -47,7 +47,22 @@ test('execute description inlines core tool declarations within budget', async (
   expect(description).toContain('Promise<{ stdout: string');
   // Tools the session lacks are not declared.
   expect(description).not.toContain('Glob(args:');
-  expect(description.length / 4).toBeLessThan(3000);
+  // Claude sends a tool description up to 4,096 characters; the rest would be cut.
+  expect(description.length).toBeLessThan(4096);
+});
+
+test('execute description carries the guidance a bypassed prompt.compose would drop', async ($, on) => {
+  const tools: ToolSpec[] = [];
+  on('tool.list', () => ({ value: catalog }));
+  on('tool.register', (_, e) => { tools.push(e); return { value: { tool: 'mcp__codemode__execute' } }; });
+  on('command.register', (_, e) => ({ value: { command: e.name } }));
+  on('session.start', () => ({ cwd: '/work' }));
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' });
+  const description = tools[0]?.description ?? '';
+  expect(description).toContain('more than one tool call');
+  expect(description).toContain('Emit only what you need');
+  expect(description).toContain('|| true');
+  expect(description).not.toContain('denied in auto mode');
 });
 
 test('tool guidance preserves descriptions and deferral, and keeps execute loaded', async ($, on) => {
@@ -177,4 +192,67 @@ test('recursive codemode calls are rejected before dispatch', async ($, on) => {
   await $.tool.call({ tool: 'mcp__codemode__execute', code: 'recursive' });
   expect(calls.length).toBe(0);
   expect(replies[0]?.error).toContain('Nested codemode');
+});
+
+type Gate = { code: string; agentId?: string; open: () => void };
+
+function gatedWorker(on: On) {
+  const gates: Gate[] = [], savedKeys: string[] = [];
+  on('tool.list', () => ({ value: catalog }));
+  on('session.id', () => ({ value: 'shared-session' }));
+  on('store.get', () => ({ value: {} }));
+  on('store.set', (_, e) => { savedKeys.push(e.key); return { value: undefined }; });
+  on('process.run', async (_, e) => {
+    const { code } = JSON.parse(String(e.init?.stdin ?? '{}'));
+    await new Promise<void>(open => { gates.push({ code, open }); });
+    return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, text: code, state: { by: code }, images: [], wall_time_ms: 1 }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
+  });
+  on('http.fetch', async () => {
+    await new Promise(resolve => setTimeout(resolve, 2));
+    return { value: { ok: true, status: 200, headers: {}, text: '{"requests":[]}' } };
+  });
+  return { gates, savedKeys };
+}
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 30));
+const textOf = (answer: ToolCallResult) => JSON.stringify(answer.result ?? answer.deny);
+
+test('parallel subagents in one session each run a script, with their own store', async ($, on) => {
+  const { gates, savedKeys } = gatedWorker(on);
+  const a = $.tool.call({ tool: 'mcp__codemode__execute', code: 'from-a', agentId: 'agent-a' });
+  const b = $.tool.call({ tool: 'mcp__codemode__execute', code: 'from-b', agentId: 'agent-b' });
+  await settle();
+  expect(gates.map(g => g.code).sort()).toEqual(['from-a', 'from-b']);
+  for (const gate of gates) gate.open();
+  expect(textOf(await a)).toContain('from-a');
+  expect(textOf(await b)).toContain('from-b');
+  expect(savedKeys.sort()).toEqual(['session:shared-session:agent:agent-a', 'session:shared-session:agent:agent-b']);
+});
+
+test('a second script from the same agent waits for the first instead of failing', async ($, on) => {
+  const { gates, savedKeys } = gatedWorker(on);
+  const first = $.tool.call({ tool: 'mcp__codemode__execute', code: 'first' });
+  const second = $.tool.call({ tool: 'mcp__codemode__execute', code: 'second' });
+  await settle();
+  expect(gates.map(g => g.code)).toEqual(['first']);
+  gates[0]?.open();
+  expect(textOf(await first)).toContain('first');
+  await settle();
+  expect(gates.map(g => g.code)).toEqual(['first', 'second']);
+  gates[1]?.open();
+  expect(textOf(await second)).toContain('second');
+  expect(savedKeys).toEqual(['session:shared-session', 'session:shared-session']);
+});
+
+test('a tool outside the session list still reaches Claude Code, which decides', async ($, on) => {
+  const { calls, replies } = bridge(on, { kind: 'call', name: 'WebFetch', args: { url: 'https://example.com', prompt: 'x' } }, { result: { code: 200 } });
+  await $.tool.call({ tool: 'mcp__codemode__execute', code: 'await tools.WebFetch({})' });
+  expect(calls.map(e => e.tool)).toEqual(['WebFetch']);
+  expect(replies[0]?.value).toEqual({ code: 200 });
+});
+
+test('invalid input is refused before anything runs', async ($, on) => {
+  setup(on);
+  const answer = await $.tool.call({ tool: 'mcp__codemode__execute', code: 'x', timeout_ms: 400000 });
+  expect(answer.deny).toBe('Codemode: timeout_ms must be an integer between 100 and 300000. Nothing ran.');
 });

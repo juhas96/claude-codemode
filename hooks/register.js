@@ -3,35 +3,31 @@ import { CORE_TOOLS, extractDeclaration, renderCoreDeclarations } from './declar
 const NAME = 'mcp__codemode__execute';
 const CONTROL_TOOLS = [NAME, 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
 const SANDBOX_SETTINGS = '{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true}}';
-const active = new Map();
+// One script at a time per agent loop: parallel subagents share the session id, so the key adds the loop's agentId.
+const scopes = new Map();
+let guidanceApplied = false;
 // `only` mode defers these native tools behind ToolSearch, so scripts become the way to call them.
 const deferred = new Set();
 
-function describeExecute(names) {
+// The description is the guidance's single source: a higher-tier plugin can bypass prompt.compose,
+// but every request carries the tool list. Claude sends at most 4,096 characters of it.
+export function describeExecute(names) {
   const declarations = renderCoreDeclarations(names);
-  return `Run JavaScript in an isolated QuickJS sandbox that calls Claude Code's native and connected MCP tools. Only what the script emits reaches your context, so use it for any step that needs more than one tool call: batch reads and searches, chain search → read → edit, apply several edits, and filter large output.
-Input: {code: "JavaScript", timeout_ms?: 60000, max_output_tokens?: 10000}. Top-level await and return are supported. No Node, filesystem, network, imports, or timers in scripts; use tools instead.
-Globals: tools.<name>(args), tools[exactName](args), callTool(name,args), ALL_TOOLS, searchTools(query,{limit?,namespace?}), describeTool(name), describeNamespace(namespace), text(value), console.log(...values), image(base64DataUrlOrImageBlock) (no await needed), store(key,value), load(key), exit(). tools return Claude Code's structured tool result; MCP object/array JSON text is decoded consistently (other text stays text). Denied/errored calls reject. Use Promise.allSettled for independent calls. Maximum 16 simultaneous calls. Await every call: outstanding calls are cancelled when the script ends.
-Only text(), console, image(), and the top-level return are included in the result. Store writes commit only on success and persist per Claude session (not inherited by a new branch). Use describeTool before unfamiliar tools. If MCP input declarations are unavailable, describeTool loads its schema through native ToolSearch for your next turn; do not guess arguments. Native and MCP calls keep Claude Code's permissions and hooks. Side effects before an error are NOT rolled back.
-${declarations ? `Core tools (exact arguments and results; find others with searchTools/describeTool):\n${declarations}\n` : ''}Example:
-const files = ['/abs/src/a.ts', '/abs/src/b.ts'];
-await Promise.all(files.map(file_path => tools.Read({ file_path })));
+  const deferredNote = deferred.size ? ` ${[...deferred].join(', ')} are deferred: call them from scripts, not through ToolSearch, unless a script call of theirs was denied.` : '';
+  return `Run JavaScript in an isolated QuickJS sandbox that calls your other tools; only what the script emits enters your context.
+Use it for any step that needs more than one tool call: reading or searching several files, searching then reading the matches, applying several edits, editing then running a check. One script replaces several parallel tool calls in one message and chains of calls across turns. Emit only what you need (lines, fields, counts, diffs), never whole files or full command output. A single call whose whole output you need may stay direct.${deferredNote}
+Input: {code, timeout_ms?: 60000, max_output_tokens?: 10000}, or a first line // @options: {"timeout_ms":120000}. Raise timeout_ms (at most 300000) for builds, tests and browsers. Top-level await and return work. No Node, filesystem, network, imports or timers: use tools.
+Globals: tools.<name>(args) and callTool(name, args) for any tool you can call, ALL_TOOLS, searchTools(query,{limit?,namespace?}), describeTool(name), describeNamespace(ns), text(value), console.log, image(base64DataUrlOrBlock), store(key,value) and load(key) (JSON kept across this agent's scripts; committed only on success), exit().
+A tool resolves to Claude Code's structured result (MCP JSON text decoded). A denied or failed call rejects, and so does Bash on a non-zero exit (grep finding nothing exits 1: add \`|| true\`), so use Promise.allSettled for independent calls; at most 16 at once. Await every call: unawaited calls are cancelled when the script ends. Calls keep Claude Code's permissions and hooks; side effects before an error are not rolled back. For an MCP tool, describeTool loads its schema for your next turn: do not guess arguments.
+${declarations ? `${declarations}\n` : ''}Example:
+const files = ['/abs/a.ts', '/abs/b.ts'];
 const edits = await Promise.allSettled(files.map(file_path => tools.Edit({ file_path, old_string: 'oldName', new_string: 'newName', replace_all: true })));
-text(edits.map((r, i) => files[i] + ': ' + (r.status === 'fulfilled' ? 'edited' : r.reason.message)));
-Optional first line: // @options: {"timeout_ms":60000,"max_output_tokens":2000}`;
+text(edits.map((r, i) => files[i] + ': ' + (r.status === 'fulfilled' ? 'edited' : r.reason.message)));`;
 }
 
+// A pointer, not a copy: the description above holds the rules.
 function guidance() {
-  const lines = [
-    '# Codemode',
-    `${NAME} runs a JavaScript script that calls your other tools (\`await tools.Read({ file_path })\`) and returns only what the script emits; intermediate tool results never enter your context.`,
-    '- Use it whenever a step needs more than one tool call: reading or searching several files, searching and then reading the matches, applying several edits, or editing and then running a check. One script replaces several parallel tool calls in one message, and chains of calls across turns.',
-    '- Emit only what you need (the lines, fields, counts or diffs), not whole files or full command output.',
-    '- A single call whose whole output you need anyway may stay direct.',
-    '- In auto mode the classifier cannot review calls made by scripts: Read and read-only commands work there, but Edit, Write and state-changing Bash are denied unless approval is not needed (for example, Bash runs in Claude Code\'s sandbox with auto-allow). Make those calls directly and keep using scripts for reading, searching and filtering.',
-  ];
-  if (deferred.size) lines.push(`- ${[...deferred].join(', ')} are deferred: call them from scripts (\`tools.Read(...)\`) instead of loading them with ToolSearch, unless a script call of theirs was denied.`);
-  return lines.join('\n');
+  return `# Codemode\nWhen a step needs more than one tool call, make it one ${NAME} script (its description has the API) instead of several direct calls.`;
 }
 
 function scriptHint(tool) {
@@ -100,8 +96,11 @@ async function handleRequest($, request, catalog, loaded) {
     return tools.length ? { name: request.name, tools } : undefined;
   }
   if (request.kind !== 'call') throw new Error('Unknown bridge operation');
+  if (typeof request.name !== 'string' || !request.name) throw new Error('Tool name must be a non-empty string');
   if (request.name === NAME) throw new Error('Nested codemode execution is not allowed');
-  if (!catalog.some(t => t.name === request.name)) throw new Error(`Unknown tool: ${request.name}`);
+  // $.tool.list() is the session's tool pool; a subagent can hold tools outside it (WebFetch in a
+  // research agent), so an unlisted name still goes to Claude Code, which checks the calling loop's tools.
+  const listed = catalog.some(t => t.name === request.name);
   const args = request.args;
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Tool arguments must be an object');
   for (const key of ['tool', 'tool_use_id', 'agentId', 'consent']) {
@@ -113,7 +112,12 @@ async function handleRequest($, request, catalog, loaded) {
     loaded.add(request.name);
   }
   // Do not use $.mcp.call: that API explicitly skips the permission dialog.
-  const result = await $.tool.call({ ...args, tool: request.name });
+  let result;
+  try { result = await $.tool.call({ ...args, tool: request.name }); }
+  catch (error) {
+    if (listed) throw error;
+    throw new Error(`Unknown tool: ${request.name} (${error.message ?? error}). ALL_TOOLS lists this session's tools`);
+  }
   if (typeof result.deny === 'string' || result.isError) {
     const message = result.deny || result.text || 'Tool failed';
     // Auto mode's classifier reviews the model's own calls only; a script's call fails closed.
@@ -128,12 +132,28 @@ async function handleRequest($, request, catalog, loaded) {
   return value;
 }
 
+const scopeKey = (session, agentId) => agentId ? `${session}\u0000${agentId}` : session;
+
+// A second script from the same agent waits for the first, including its draining tool calls, instead of failing.
+async function acquire(key, signal) {
+  while (scopes.has(key)) {
+    let onAbort;
+    const aborted = new Promise(resolve => { onAbort = resolve; signal.addEventListener('abort', onAbort, { once: true }); });
+    try { await Promise.race([scopes.get(key).released, aborted]); }
+    finally { signal.removeEventListener('abort', onAbort); }
+    if (signal.aborted) throw new Error('Script cancelled');
+  }
+  let release;
+  const scope = { lifecycle: new AbortController(), released: new Promise(resolve => { release = resolve; }) };
+  scopes.set(key, scope);
+  return { lifecycle: scope.lifecycle, release: () => { if (scopes.get(key) === scope) scopes.delete(key); release(); } };
+}
+
 async function runScript($, input, signal) {
-  validateInput(input);
   const session = await $.session.id();
-  if (active.has(session)) throw new Error('Only one codemode script may run per session at a time');
-  const lifecycle = new AbortController();
-  active.set(session, lifecycle);
+  const { lifecycle, release } = await acquire(scopeKey(session, input.agentId), signal);
+  // The main loop keeps the original key, so its stored state survives the upgrade.
+  const stateKey = input.agentId ? `session:${session}:agent:${input.agentId}` : `session:${session}`;
   const token = crypto.randomUUID();
   const socketPath = `/tmp/cc-codemode-${crypto.randomUUID()}/bridge.sock`;
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
@@ -144,9 +164,10 @@ async function runScript($, input, signal) {
   signal.addEventListener('abort', cancel, { once: true });
   try {
     const catalog = catalogOf(await $.tool.list());
-    const state = (await $.store.get(`session:${session}`)) ?? {};
+    const state = (await $.store.get(stateKey)) ?? {};
+    const { code, timeout_ms, max_output_tokens } = input;
     const worker = $.process.run(['node', `${$.plugin.root}/dist/worker.mjs`], {
-      stdin: JSON.stringify({ ...input, catalog, state, token, socketPath }), timeoutMs: 310000,
+      stdin: JSON.stringify({ code, timeout_ms, max_output_tokens, catalog, state, token, socketPath }), timeoutMs: 310000,
     }).then(result => { finished = true; return result; }, error => { finished = true; throw error; });
     // Attach a rejection handler immediately, including during socket startup.
     void worker.catch(() => {});
@@ -184,7 +205,7 @@ async function runScript($, input, signal) {
     if (process.isStdoutTruncated) throw new Error('Worker response exceeded Claude Code\'s process output limit');
     const result = parseJson(process.stdout);
     if (process.exitCode && result.ok) throw new Error(process.stderr || 'Worker failed');
-    if (result.ok) await $.store.set(`session:${session}`, result.state);
+    if (result.ok) await $.store.set(stateKey, result.state);
     delete result.state;
     return result;
   } finally {
@@ -192,8 +213,8 @@ async function runScript($, input, signal) {
     signal.removeEventListener('abort', cancel);
     lifecycle.abort();
     // Keep the stopped scope until queued calls see it, including delayed host hooks.
-    if (pending.size) void Promise.allSettled(pending).then(() => active.delete(session));
-    else active.delete(session);
+    if (pending.size) void Promise.allSettled(pending).then(release);
+    else release();
   }
 }
 
@@ -208,7 +229,7 @@ function render(result) {
   return { content, isError: !result.ok };
 }
 
-const AUTO_MODE_NOTE = `\nAuto mode: scripts can read and search (Read, read-only Bash), but Edit, Write and state-changing Bash calls from scripts are denied, because the classifier only reviews the model's own calls. Enable Claude Code's Bash sandbox so sandboxed commands from scripts run without review: ${SANDBOX_SETTINGS}`;
+const AUTO_MODE_NOTE = `\nAuto mode: if a script's call is denied because the classifier gave no verdict, make that call directly, or enable Claude Code's Bash sandbox so sandboxed commands run without review: ${SANDBOX_SETTINGS}`;
 
 async function autoModeNote($) {
   try { return (await $.config.list()).some(row => row.key === 'permissionMode' && row.value === 'auto') ? AUTO_MODE_NOTE : ''; }
@@ -226,6 +247,7 @@ export function register(on, options = {}) {
   on('prompt.compose', async (_, e, next) => {
     const result = await next(e);
     if (!e.tools.includes(NAME)) return result;
+    guidanceApplied = true;
     return { sections: [...result.sections, { id: 'codemode:guidance', text: guidance(), scope: 'session' }] };
   });
   on('session.start', async ($, e, next) => {
@@ -245,6 +267,8 @@ export function register(on, options = {}) {
     return next(e);
   });
   on('tool.call', { tool: NAME }, async ($, e, next) => {
+    try { validateInput(e); }
+    catch (error) { return { deny: `Codemode: ${error.message ?? error}. Nothing ran.` }; }
     try {
       const result = await runScript($, e, next.signal);
       const { content } = render(result);
@@ -255,7 +279,7 @@ export function register(on, options = {}) {
   // Returning while next(e) is pending aborts that child dispatch in Claude.
   on('tool.call', async ($, e, next) => {
     if (next.origin.plugin !== $.plugin.name) return next(e);
-    const lifecycle = active.get(await $.session.id());
+    const lifecycle = scopes.get(scopeKey(await $.session.id(), e.agentId))?.lifecycle;
     if (!lifecycle) return next(e);
     if (lifecycle.signal.aborted) return { deny: 'Codemode script ended; tool call cancelled' };
     let stop;
@@ -271,7 +295,8 @@ export function register(on, options = {}) {
       if (check.exitCode) throw new Error(check.stderr || check.stdout);
       const info = parseJson(check.stdout);
       const mode = deferred.size ? ` Mode: only (${[...deferred].join(', ')} deferred to scripts).` : ' Mode: on.';
-      return { text: `${info.runtime} ready (${info.node}). ${tools.filter(t => !t.mcp).length} native tools, ${tools.filter(t => t.mcp).length} MCP tools. The agent can use the execute tool automatically.${mode}${await autoModeNote($)}` };
+      const prompt = guidanceApplied ? '' : '\nSystem-prompt pointer: not applied to any request yet. A higher-tier plugin can bypass codemode\'s prompt.compose hook (`claude --debug` logs "prompt.compose bypassed by <plugin>"); the execute tool description still carries the guidance.';
+      return { text: `${info.runtime} ready (${info.node}). ${tools.filter(t => !t.mcp).length} native tools, ${tools.filter(t => t.mcp).length} MCP tools. The agent can use the execute tool automatically.${mode}${prompt}${await autoModeNote($)}` };
     } catch (error) { return { text: `Runtime unavailable: ${error.message ?? error}. Reinstall the plugin; Node.js 22+ and a Unix host are required.` }; }
   });
 }

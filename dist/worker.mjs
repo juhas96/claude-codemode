@@ -1821,13 +1821,18 @@ var bootstrap = `
       return Promise.reject(new Error('Tool arguments must be an object'));
     return call('call', name, args);
   };
-  const tools = Object.create(null);
-  for (const tool of initial) tools[tool.name] = args => invoke(tool.name, args);
+  const known = Object.create(null);
+  for (const tool of initial) known[tool.name] = args => invoke(tool.name, args);
   for (const tool of initial) {
-    if (tool.method && !(tool.method in tools)) tools[tool.method] = args => invoke(tool.name, args);
+    if (tool.method && !(tool.method in known)) known[tool.method] = args => invoke(tool.name, args);
   }
-  Object.freeze(tools);
-  globalThis.tools = tools;
+  Object.freeze(known);
+  // A name outside the catalog (a subagent's own tool, a tool loaded later) still dispatches; the host decides.
+  globalThis.tools = new Proxy(known, {
+    get: (target, name) => typeof name !== 'string' || name in target || name === 'then'
+      ? target[name] : args => invoke(name, args),
+    set: () => false, defineProperty: () => false, deleteProperty: () => false,
+  });
   globalThis.callTool = invoke;
   globalThis.ALL_TOOLS = Object.freeze(initial.map(t => Object.freeze(t)));
   globalThis.text = print;
@@ -1884,7 +1889,7 @@ async function runSandbox(input, dispatch, { signal, isCancelled = () => false, 
   const vm = runtime.newContext();
   const output = [], images = [];
   let imageBytes = 0;
-  const pending = /* @__PURE__ */ new Set();
+  const pending = /* @__PURE__ */ new Set(), waiting = /* @__PURE__ */ new Map();
   const controller = new AbortController();
   const values = new Map(Object.entries(state).map(([k, v]) => [k, JSON.stringify(v)]));
   let wake, closed = false, calls = 0, bytes = 0, error, root;
@@ -1923,6 +1928,7 @@ async function runSandbox(input, dispatch, { signal, isCancelled = () => false, 
     if (pending.size >= LIMITS.concurrency) throw new Error("At most 16 concurrent bridge calls");
     const deferred = vm.newPromise();
     pending.add(deferred);
+    waiting.set(deferred, request.kind === "call" ? String(request.name) : `${request.kind}()`);
     Promise.resolve().then(() => {
       if (closed || controller.signal.aborted) throw new Error("Bridge call cancelled");
       return dispatch(request, controller.signal);
@@ -1953,6 +1959,7 @@ async function runSandbox(input, dispatch, { signal, isCancelled = () => false, 
     }).finally(() => {
       if (!closed) {
         pending.delete(deferred);
+        waiting.delete(deferred);
         deferred.dispose();
         notify();
       }
@@ -2044,8 +2051,10 @@ ${config.code}
     }
   } catch (failure) {
     if (signal?.aborted || isCancelled()) error = "Script cancelled";
-    else if (Date.now() >= deadline) error = "Script timed out";
-    else error = String(failure?.message ?? failure) || "Script failed";
+    else if (Date.now() >= deadline) {
+      const names = [...new Set(waiting.values())];
+      error = `Script timed out after ${config.timeout_ms} ms${names.length ? ` waiting on ${names.join(", ")}` : ""}; raise timeout_ms (at most 300000) for builds, test runs and browsers`;
+    } else error = String(failure?.message ?? failure) || "Script failed";
   } finally {
     closed = true;
     controller.abort();
